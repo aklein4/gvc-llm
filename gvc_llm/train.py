@@ -33,9 +33,9 @@ class Config:
     stop_check_interval: int = 16
     max_prompt_length: int = 1024
     max_response_length: int = 1024
-    beta: float = 0.01
-    kl_target: float = 1.0
-    kl_range: float = 0.1
+    beta: float = 0.1
+    kl_target: float = 0.1
+    kl_range: float = 0.01
     delta_log_beta: float = 0.1
     min_beta: float = 0.0001
     max_beta: float = 100.0
