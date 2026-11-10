@@ -26,8 +26,8 @@ class Config:
     model: str = "Qwen/Qwen2.5-0.5B"
     train_file: str = "data/deepmath/train.parquet"
     steps: int = 1000
-    batch_size: int = 64
-    micro_batch_size: int = 16
+    batch_size: int = 32
+    micro_batch_size: int = 8
     decode_mode: str = "compiled"
     stop_check_interval: int = 16
     max_prompt_length: int = 1024

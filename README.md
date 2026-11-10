@@ -80,10 +80,12 @@ the positive vector starts at zero. They are added to every prompt/response
 token embedding. The prior starts at zero. Only the
 observed-return branch receives token-likelihood targets; the positive branch
 supplies prior features for both outcomes. Prompt/padding targets are masked,
-EOS is included. Both token NLL and prior NLL give equal weight to the positive
+EOS is included. Token NLL gives equal weight to the positive
 and negative outcome token means, using counts from the complete rollout batch
 across all microbatches. If only one outcome exists, its token mean gets full
-weight; the absent outcome contributes zero. Branch probabilities are vocabulary-normalized
+weight; the absent outcome contributes zero. Prior NLL is unweighted and averaged
+over all valid response tokens, preserving their observed return frequencies.
+Branch probabilities are vocabulary-normalized
 before Bayes' rule. The policy remains frozen throughout.
 
 Training computes the LM head and cross entropy in checkpointed chunks of

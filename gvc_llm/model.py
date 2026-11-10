@@ -83,7 +83,8 @@ class GenerativeCritic(nn.Module):
 
         State at position t predicts action at t+1. Prompt/pad tokens never
         contribute targets. Positive features train the prior for *all* returns.
-        Optional outcome weights must be computed over the full rollout batch.
+        Optional token-likelihood outcome weights use the full rollout batch.
+        The prior is unweighted to preserve the observed return frequencies.
         """
         ids, mask = batch["input_ids"], batch["attention_mask"]
         returns, response_mask = batch["returns"].long(), batch["response_mask"].bool()
@@ -103,8 +104,7 @@ class GenerativeCritic(nn.Module):
         if outcome_weights is None:
             outcome_weights = torch.ones(2, device=ids.device)
         prior_loss = F.cross_entropy(self.prior(positive[response_mask].float()),
-                                     labels[response_mask], reduction="none")
-        prior_loss = (prior_loss * outcome_weights[labels[response_mask]]).sum()
+                                     labels[response_mask], reduction="sum")
         likelihood = self.token_nll_sum(observed[response_mask], actions[response_mask],
                                         outcome_weights[labels[response_mask]])
         return likelihood, prior_loss

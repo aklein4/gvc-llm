@@ -254,13 +254,15 @@ def test_balanced_losses_and_microbatch_gradients(returns):
     weights = balanced_token_weights(batch['returns'], batch['response_mask'])
     denominator = batch['response_mask'].sum()
     actual = full.loss_sums(batch, weights)
-    # Independent reference: average token means of the outcomes that exist.
+    # Token NLL averages outcome means; the prior averages all valid tokens.
     expected = torch.zeros(2)
     outcomes = set(returns)
     for outcome in outcomes:
         rows = batch['returns'] == outcome
         subset = {k: v[rows] for k, v in batch.items()}
-        expected = expected + torch.stack(full.loss_sums(subset)) / subset['response_mask'].sum() / len(outcomes)
+        nll, prior = full.loss_sums(subset)
+        expected = expected + torch.stack((nll / subset['response_mask'].sum() / len(outcomes),
+                                           prior / denominator))
     torch.testing.assert_close(torch.stack(actual) / denominator, expected)
     (sum(actual) / denominator).backward()
     for row in range(2):
@@ -330,7 +332,7 @@ def test_joint_training_forward_matches_separate_branches(returns):
         expected_nll += weights[outcome] * torch.nn.functional.cross_entropy(
             separate.logits(observed[:, -3:-1][selected]).float(),
             batch['responses'][row:row+1][selected], reduction='sum')
-        expected_prior += weights[outcome] * torch.nn.functional.cross_entropy(
+        expected_prior += torch.nn.functional.cross_entropy(
             separate.prior(positive[:, -3:-1][selected].float()),
             r.expand(int(selected.sum())), reduction='sum')
     torch.testing.assert_close(actual[0], expected_nll)
