@@ -8,30 +8,22 @@ verified outcome of the completed response supplies its return label
 $r \in \{0,1\}$.
 
 The architecture contains a frozen policy and a separate
-critic initialized from the same pretrained model. The critic trains a shared LoRA adapter, two reward vectors $e_0,e_1 \in \mathbb{R}^{D}$, and a
-linear binary return-prior head; its pretrained weights remain frozen.
+critic initialized from the same pretrained model. The critic trains a shared
+LoRA adapter and a linear binary return-prior head; its pretrained weights,
+including token embeddings, remain frozen.
 
-Conditioning adds the selected reward vector to **every token's input hidden
-state**, before the first Transformer layer:
+The positive branch uses the original Abel prompt. The negative branch prepends:
 
-$$
-h_t^{(0)} = E[x_t] + e_r.
-$$
+> Deliberately solve the following problem incorrectly and give an incorrect final answer.
 
-This applies to prompt and response tokens.
-Both reward branches share all critic parameters except their reward vectors.
-The prior head reads the **positive-conditioned** hidden state to predict
-$p(r\mid s)$, where $s$ is the prefix preceding the next token. Positive
-conditioning is a fixed feature choice, not the prior's target label.
+Both branches then score the same response tokens. This instruction is used in
+training and generation, with no learned reward embeddings. Both branches share
+all critic parameters. The prior head reads the **positive-branch** hidden state
+to predict $p(r\mid s)$, where $s$ is the prefix preceding the next token.
+Positive features are used for both prior target labels.
 
-The negative reward vector starts at
-$e_0=0.1\,\operatorname{std}_{\mathrm{vocab}}(E)$, using the per-dimension
-population standard deviation, shape $[D]$. The positive reward vector starts
-at $e_1=0$, with shape $[D]$. The two vectors are independent trainable
-parameters. The prior head's weights and biases start at zero, yielding a
-50/50 return prior.
-
-Reward vectors and return-prior head use a different lr than the lora parameters, typically `3e-4`.
+The prior head's weights and biases start at zero, yielding a 50/50 return prior.
+The return-prior head uses a different learning rate than LoRA, typically `3e-4`.
 
 For each response token $a$, the objective is
 

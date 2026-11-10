@@ -1,4 +1,4 @@
-"""The return-conditioned critic. Only LoRA, reward vectors, and prior train."""
+"""The return-conditioned critic. Only LoRA and the prior train."""
 
 import torch
 from peft import LoraConfig, get_peft_model
@@ -26,8 +26,11 @@ def posterior(logits0, logits1, prior_logits):
     return torch.sigmoid(log_p1 - log_p0 + log_prior[..., 1:2] - log_prior[..., 0:1])
 
 
+NEGATIVE_PROMPT = "Deliberately make a mistake and give an incorrect final answer.\n\n"
+
+
 class GenerativeCritic(nn.Module):
-    def __init__(self, pretrained, rank=8, lm_head_chunk_size=128):
+    def __init__(self, pretrained, rank=8, lm_head_chunk_size=128, *, tokenizer):
         super().__init__()
         if lm_head_chunk_size < 1:
             raise ValueError("lm_head_chunk_size must be positive")
@@ -38,9 +41,12 @@ class GenerativeCritic(nn.Module):
             task_type="CAUSAL_LM",
         ))
         embedding = self.lm.get_input_embeddings().weight
-        # Population std across the vocabulary, separately for every dimension.
-        initial = 0.1 * embedding.detach().float().std(dim=0, correction=0)
-        self.reward_vectors = nn.Parameter(torch.stack((initial, torch.zeros_like(initial))))
+        self.register_buffer("negative_prompt_ids", torch.tensor(
+            tokenizer.encode(NEGATIVE_PROMPT, add_special_tokens=False),
+            device=embedding.device, dtype=torch.long,
+        ))
+        if not self.negative_prompt_ids.numel():
+            raise ValueError("Negative prompt must tokenize to at least one token")
         self.prior = nn.Linear(embedding.shape[1], 2, device=embedding.device, dtype=torch.float32)
         nn.init.zeros_(self.prior.weight)
         nn.init.zeros_(self.prior.bias)
@@ -49,16 +55,53 @@ class GenerativeCritic(nn.Module):
     def decoder(self):
         return self.lm.get_base_model().model  # Qwen2.5 decoder; LoRA modules remain active.
 
+    @property
+    def prefix_length(self):
+        return self.negative_prompt_ids.numel()
+
     def features(self, ids, mask, returns, *, cache=None, use_cache=False,
-                 position_ids=None, cache_position=None):
-        embeddings = self.lm.get_input_embeddings()(ids)
-        embeddings = embeddings + self.reward_vectors[returns, None].to(embeddings.dtype)
+                 position_ids=None, cache_position=None, prefill=None):
+        # Reserve the same prefix slots for both branches; positive slots are
+        # masked out so its positions and visible context remain unchanged.
+        if prefill is None:
+            prefill = cache is None or cache.get_seq_length() == 0
+        width = ids.shape[1]
+        n = self.prefix_length
+        prefix_mask = (returns == 0)[:, None].expand(-1, n)
+        offset = prefix_mask.sum(-1, keepdim=True)
+        if position_ids is None:
+            position_ids = positions(mask)[:, -width:]
+        position_ids = position_ids + offset
+        if mask.ndim == 2:
+            mask = torch.cat((prefix_mask.to(mask.dtype), mask), dim=-1)
+        else:
+            # Static-cache masks include unused future keys. Add instruction
+            # keys to every original query, and causal instruction queries.
+            prefix_keys = prefix_mask[:, None, None, :].expand(-1, 1, width, -1)
+            original_mask = mask
+            mask = torch.cat((prefix_keys, mask), dim=-1)
+            if prefill:
+                prefix_queries = torch.zeros(
+                    (ids.shape[0], 1, n, original_mask.shape[-1] + n),
+                    dtype=mask.dtype, device=ids.device,
+                )
+                prefix_queries[..., :n] = (
+                    torch.ones(n, n, dtype=torch.bool, device=ids.device).tril()[None, None]
+                    & prefix_mask[:, None, None, :]
+                )
+                mask = torch.cat((prefix_queries, mask), dim=-2)
+        if prefill:
+            ids = torch.cat((self.negative_prompt_ids[None].expand(ids.shape[0], -1), ids), dim=-1)
+            position_ids = torch.cat((positions(prefix_mask), position_ids), dim=-1)
+            if cache_position is not None:
+                cache_position = torch.arange(ids.shape[1], device=ids.device)
+        elif cache_position is not None:
+            cache_position = cache_position + n
         out = self.decoder(
-            inputs_embeds=embeddings, attention_mask=mask,
-            position_ids=positions(mask)[:, -ids.shape[1]:] if position_ids is None else position_ids,
+            input_ids=ids, attention_mask=mask, position_ids=position_ids,
             past_key_values=cache, use_cache=use_cache, cache_position=cache_position,
         )
-        return out.last_hidden_state, out.past_key_values
+        return out.last_hidden_state[:, -width:], out.past_key_values
 
     def logits(self, hidden):
         return self.lm.get_output_embeddings()(hidden)
@@ -112,5 +155,5 @@ class GenerativeCritic(nn.Module):
     def optimizer(self, lora_lr=1e-4, head_lr=3e-4):
         return torch.optim.AdamW([
             {"params": [p for p in self.lm.parameters() if p.requires_grad], "lr": lora_lr},
-            {"params": [self.reward_vectors, *self.prior.parameters()], "lr": head_lr},
+            {"params": list(self.prior.parameters()), "lr": head_lr},
         ], weight_decay=0.0)

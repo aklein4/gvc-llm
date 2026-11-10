@@ -12,6 +12,11 @@ from gvc_llm.model import GenerativeCritic, posterior
 from gvc_llm.rollout import GuidedRollout
 
 
+def tiny_tokenizer():
+    return SimpleNamespace(encode=lambda text, add_special_tokens=False: [11, 12, 13],
+                           pad_token_id=0, eos_token_id=2)
+
+
 def tiny_lm():
     torch.manual_seed(4)
     return Qwen2ForCausalLM(Qwen2Config(
@@ -33,11 +38,9 @@ def tiny_batch(returns=(0, 1)):
 
 def test_initialization_and_frozen_weights():
     lm = tiny_lm()
-    expected = .1 * lm.get_input_embeddings().weight.detach().std(0, correction=0)
-    critic = GenerativeCritic(lm, rank=2)
-    torch.testing.assert_close(critic.reward_vectors[0], expected)
-    torch.testing.assert_close(critic.reward_vectors[1], torch.zeros_like(expected))
-    assert critic.reward_vectors[0].data_ptr() != critic.reward_vectors[1].data_ptr()
+    critic = GenerativeCritic(lm, rank=2, tokenizer=tiny_tokenizer())
+    assert not hasattr(critic, 'reward_vectors')
+    assert not critic.negative_prompt_ids.requires_grad
     assert all('lora_' in n for n, p in critic.lm.named_parameters() if p.requires_grad)
     torch.testing.assert_close(critic.prior(torch.randn(3, 16)), torch.zeros(3, 2))
     opt = critic.optimizer(1e-4, 3e-4)
@@ -53,9 +56,8 @@ def test_bayes_uses_vocab_normalization_and_prior():
 
 
 def test_loss_alignment_masking_and_positive_prior():
-    critic = GenerativeCritic(tiny_lm(), rank=2)
+    critic = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tiny_tokenizer())
     with torch.no_grad():
-        critic.reward_vectors[0].add_(.15 * torch.randn(16))
         critic.prior.weight.normal_(std=.1)
     batch = tiny_batch()
     nll, prior = critic.loss_sums(batch)
@@ -79,21 +81,21 @@ def test_loss_alignment_masking_and_positive_prior():
 
 
 def test_observed_branch_gradient_and_frozen_backbone():
-    critic = GenerativeCritic(tiny_lm(), rank=2)
+    critic = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tiny_tokenizer())
     batch = tiny_batch((0, 0))
     before = {n: p.detach().clone() for n, p in critic.named_parameters() if not p.requires_grad}
     nll, _ = critic.loss_sums(batch)
     nll.backward()
-    assert critic.reward_vectors.grad[0].norm() > 0
-    assert critic.reward_vectors.grad[1].norm() == 0  # No positive likelihood target.
+    assert any(p.grad is not None and p.grad.norm() > 0
+               for p in critic.lm.parameters() if p.requires_grad)
     critic.zero_grad(set_to_none=True)
     # With a nonzero prior head, negative outcomes still train positive features.
     with torch.no_grad():
         critic.prior.weight.normal_()
     _, prior = critic.loss_sums(batch)
     prior.backward()
-    assert critic.reward_vectors.grad[1].norm() > 0
-    assert critic.reward_vectors.grad[0].norm() == 0
+    assert any(p.grad is not None and p.grad.norm() > 0
+               for p in critic.lm.parameters() if p.requires_grad)
     critic.optimizer().step()
     for n, p in critic.named_parameters():
         if n in before:
@@ -101,12 +103,11 @@ def test_observed_branch_gradient_and_frozen_backbone():
 
 
 def test_cached_conditioning_matches_full_prefix():
-    critic = GenerativeCritic(tiny_lm(), rank=2).eval()
+    critic = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tiny_tokenizer()).eval()
     ids = torch.tensor([[0, 3, 4, 5], [6, 7, 8, 9]])
     mask = (ids != 0).long()
     r = torch.tensor([0, 1])
     with torch.no_grad():
-        critic.reward_vectors[1].add_(torch.randn(16) * .1)
         full, _ = critic.features(ids, mask, r)
         _, cache = critic.features(ids[:, :-1], mask[:, :-1], r, use_cache=True)
         incremental, _ = critic.features(ids[:, -1:], mask, r, cache=cache, use_cache=True)
@@ -114,11 +115,9 @@ def test_cached_conditioning_matches_full_prefix():
 
 
 @pytest.mark.parametrize("decode_mode", ["eager", "static"])
-def test_equal_branches_recover_base_policy_and_rollout_mask(decode_mode):
+def test_prompt_conditioned_rollout_mask(decode_mode):
     base = tiny_lm().eval().requires_grad_(False)
-    critic = GenerativeCritic(copy.deepcopy(base), rank=2).eval()
-    with torch.no_grad():
-        critic.reward_vectors[1].copy_(critic.reward_vectors[0])
+    critic = GenerativeCritic(copy.deepcopy(base), rank=2, tokenizer=tiny_tokenizer()).eval()
     prompts = DataProto.from_dict(tensors={
         'input_ids': torch.tensor([[0, 3, 4], [6, 7, 8]]),
         'attention_mask': torch.tensor([[0, 1, 1], [1, 1, 1]]),
@@ -128,8 +127,8 @@ def test_equal_branches_recover_base_policy_and_rollout_mask(decode_mode):
     guided = GuidedRollout(base, critic, tokenizer, beta=.1, response_length=4, decode_mode=decode_mode, max_prompt_length=3).generate_sequences(prompts)
     torch.manual_seed(33)
     unguided = GuidedRollout(base, critic, tokenizer, beta=float('inf'), response_length=4, decode_mode=decode_mode, max_prompt_length=3).generate_sequences(prompts)
-    torch.testing.assert_close(guided.batch['responses'], unguided.batch['responses'])
-    assert guided.meta_info['metrics']['rollout/q_mean'] == pytest.approx(.5)
+    assert 0 < guided.meta_info['metrics']['rollout/q_mean'] < 1
+    assert unguided.meta_info['metrics']['rollout/kl'] == 0
     mask = guided.batch['response_mask']
     assert (mask[:, 1:].int() <= mask[:, :-1].int()).all()
     assert guided.batch['attention_mask'].shape == guided.batch['input_ids'].shape
@@ -149,7 +148,7 @@ def test_binary_math_reward_without_format_penalty():
 
 def test_microbatch_accumulation_preserves_token_weighting():
     batch = tiny_batch()  # Two response tokens in row 0; only one in row 1.
-    full = GenerativeCritic(tiny_lm(), rank=2)
+    full = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tiny_tokenizer())
     micro = copy.deepcopy(full)
     denominator = batch['response_mask'].sum()
     nll, prior = full.loss_sums(batch)
@@ -179,7 +178,7 @@ def test_abel_prompt_is_not_wrapped_in_chat():
 def test_static_rollout_matches_dynamic_and_resets_after_update():
     base = tiny_lm().eval().requires_grad_(False)
     base.generation_config.eos_token_id = -1  # Fixed work for RNG-coupled comparison.
-    critic = GenerativeCritic(copy.deepcopy(base), rank=2).eval()
+    critic = GenerativeCritic(copy.deepcopy(base), rank=2, tokenizer=tiny_tokenizer()).eval()
     tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=2)
     prompts = DataProto.from_dict(tensors={
         'input_ids': torch.tensor([[0, 0, 3, 4], [0, 6, 7, 8]]),
@@ -213,7 +212,7 @@ def test_delayed_stop_keeps_only_first_eos():
     base = tiny_lm().eval().requires_grad_(False)
     # Every vocabulary entry is a stop token: exactly one action per response.
     base.generation_config.eos_token_id = list(range(32))
-    critic = GenerativeCritic(copy.deepcopy(base), rank=2).eval()
+    critic = GenerativeCritic(copy.deepcopy(base), rank=2, tokenizer=tiny_tokenizer()).eval()
     tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=2)
     prompts = DataProto.from_dict(tensors={
         'input_ids': torch.tensor([[3, 4], [7, 8]]),
@@ -247,7 +246,7 @@ def test_balanced_losses_and_microbatch_gradients(returns):
     from gvc_llm.model import balanced_token_weights
 
     batch = tiny_batch(returns)
-    full = GenerativeCritic(tiny_lm(), rank=2)
+    full = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tiny_tokenizer())
     with torch.no_grad():
         full.prior.weight.normal_(std=.1)
     micro = copy.deepcopy(full)
@@ -285,7 +284,7 @@ def test_balanced_weights_with_no_response_tokens():
 
 @pytest.mark.parametrize('chunk_size', [17, 128, 512])
 def test_checkpointed_lm_head_matches_dense_loss_and_gradients(chunk_size):
-    critic = GenerativeCritic(tiny_lm(), rank=2, lm_head_chunk_size=chunk_size)
+    critic = GenerativeCritic(tiny_lm(), rank=2, lm_head_chunk_size=chunk_size, tokenizer=tiny_tokenizer())
     hidden = torch.randn(259, 16, requires_grad=True)  # Two full chunks and a tail.
     reference = hidden.detach().clone().requires_grad_(True)
     targets = torch.randint(32, (259,))
@@ -311,7 +310,7 @@ def test_joint_training_forward_matches_separate_branches(returns):
     from gvc_llm.model import balanced_token_weights
 
     batch = tiny_batch(returns)
-    joint = GenerativeCritic(tiny_lm(), rank=2)
+    joint = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tiny_tokenizer())
     with torch.no_grad():
         joint.prior.weight.normal_(std=.1)
     separate = copy.deepcopy(joint)
@@ -342,3 +341,25 @@ def test_joint_training_forward_matches_separate_branches(returns):
     for (name, p), (_, q) in zip(joint.named_parameters(), separate.named_parameters()):
         if p.requires_grad:
             torch.testing.assert_close(p.grad, q.grad, atol=2e-6, rtol=1e-4, msg=name)
+
+
+@torch.no_grad()
+def test_instruction_prefix_matches_explicit_prompt_and_preserves_positive():
+    from gvc_llm.model import NEGATIVE_PROMPT, positions
+
+    encoded = []
+    tokenizer = tiny_tokenizer()
+    tokenizer.encode = lambda text, add_special_tokens: encoded.append((text, add_special_tokens)) or [11, 12, 13]
+    critic = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tokenizer).eval()
+    assert encoded == [(NEGATIVE_PROMPT, False)]
+    ids = torch.tensor([[0, 3, 4], [5, 6, 7]])
+    mask = (ids != 0).long()
+    for outcome in (0, 1):
+        actual, _ = critic.features(ids, mask, torch.full((2,), outcome))
+        expected_ids, expected_mask = ids, mask
+        if outcome == 0:
+            expected_ids = torch.cat((torch.tensor([[11, 12, 13]]).expand(2, -1), ids), -1)
+            expected_mask = torch.cat((torch.ones(2, 3, dtype=torch.long), mask), -1)
+        expected = critic.decoder(input_ids=expected_ids, attention_mask=expected_mask,
+                                  position_ids=positions(expected_mask)).last_hidden_state[:, -3:]
+        torch.testing.assert_close(actual[mask.bool()], expected[mask.bool()], atol=1e-6, rtol=1e-5)

@@ -19,6 +19,7 @@ from verl.utils.tracking import Tracking
 
 from .model import GenerativeCritic
 from .rollout import GuidedRollout
+from .adaptive_beta import AdaptiveBeta
 
 
 @dataclass
@@ -32,7 +33,12 @@ class Config:
     stop_check_interval: int = 16
     max_prompt_length: int = 1024
     max_response_length: int = 1024
-    beta: float = 1.0
+    beta: float = 0.01
+    kl_target: float = 1.0
+    kl_range: float = 0.1
+    delta_log_beta: float = 0.1
+    min_beta: float = 0.0001
+    max_beta: float = 100.0
     temperature: float = 1.0
     lora_rank: int = 32
     lm_head_chunk_size: int = 2048
@@ -54,6 +60,11 @@ def main():
     cfg = Config(**vars(parser.parse_args()))
     if min(cfg.steps, cfg.batch_size, cfg.micro_batch_size, cfg.save_every, cfg.lm_head_chunk_size) < 1:
         parser.error("steps, batch sizes, save-every, and lm-head-chunk-size must be positive")
+    try:
+        beta_controller = AdaptiveBeta(cfg.beta, cfg.kl_target, cfg.kl_range, cfg.delta_log_beta,
+                                       cfg.min_beta, cfg.max_beta)
+    except ValueError as error:
+        parser.error(str(error))
     torch.set_num_threads(4)
     set_seed(cfg.seed)
     output = Path(cfg.output_dir)
@@ -77,9 +88,9 @@ def main():
     ).cuda().requires_grad_(False).eval()
     critic = GenerativeCritic(AutoModelForCausalLM.from_pretrained(
         cfg.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-    ).cuda(), cfg.lora_rank, lm_head_chunk_size=cfg.lm_head_chunk_size)
+    ).cuda(), cfg.lora_rank, lm_head_chunk_size=cfg.lm_head_chunk_size, tokenizer=tokenizer)
     optimizer = critic.optimizer(cfg.lora_lr, cfg.head_lr)
-    rollout = GuidedRollout(policy, critic, tokenizer, cfg.beta, cfg.temperature, cfg.max_response_length,
+    rollout = GuidedRollout(policy, critic, tokenizer, beta_controller.beta, cfg.temperature, cfg.max_response_length,
                             cfg.decode_mode, cfg.max_prompt_length, cfg.stop_check_interval)
     if cfg.decode_mode == "compiled":
         print("First rollout includes torch.compile warmup; later rollouts reuse the graph.", flush=True)
@@ -112,15 +123,17 @@ def main():
             prior_sum += prior.detach().item()
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable.values(), 1.0).item()
         optimizer.step()
+        beta_metrics = beta_controller.update(batch.meta_info["metrics"]["rollout/kl"])
+        rollout.beta = beta_controller.beta
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         metrics = {
             **batch.meta_info["metrics"],
+            **beta_metrics,
             "train/loss": (likelihood_sum + prior_sum) / tokens,
             "train/token_nll": likelihood_sum / tokens,
             "train/prior_nll": prior_sum / tokens,
             "train/grad_norm": grad_norm,
-            "train/reward_vector_distance": (critic.reward_vectors[1] - critic.reward_vectors[0]).norm().item(),
             "train/lora_lr": cfg.lora_lr, "train/head_lr": cfg.head_lr,
             "train/reward_mean": sum(rewards) / len(rewards),
             "train/positive_count": sum(rewards),
@@ -140,6 +153,7 @@ def main():
                 "step": step, "config": asdict(cfg),
                 "trainable": {n: p.detach().cpu() for n, p in trainable.items()},
                 "optimizer": optimizer.state_dict(),
+                "log_beta": beta_controller.log_beta,
             }, output / "critic.pt")
     # Explicit finish so the command exits only after W&B flushes.
     logger.logger["wandb"].finish()

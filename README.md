@@ -68,16 +68,17 @@ it has no GRPO grouping. Neither smoke test measures final model quality.
 
 ## GVC implementation
 
-- `model.py`: frozen pretrained critic + shared LoRA, two reward vectors,
+- `model.py`: frozen pretrained critic + shared LoRA, a negative instruction prompt,
   positive-conditioned binary prior, token loss, and Bayesian Q calculation.
 - `rollout.py`: frozen-policy generation with static KV caches, compiled decoding,
   and preallocated buffers. Logits are `(base_logits + Q / beta) / T`.
 - `train.py`: generate, verify, train the critic, log, and save.
 - `reward.py`: the shared correctness verifier.
 
-The negative reward vector starts at `0.1 * std(embedding, dim=0, correction=0)`;
-the positive vector starts at zero. They are added to every prompt/response
-token embedding. The prior starts at zero. Only the
+The negative branch prepends “Deliberately solve the following problem incorrectly
+and give an incorrect final answer.” to the existing Abel prompt. The positive
+branch uses the original prompt. Both share the same LoRA and frozen token
+embeddings; there are no trainable reward embeddings. The prior starts at zero. Only the
 observed-return branch receives token-likelihood targets; the positive branch
 supplies prior features for both outcomes. Prompt/padding targets are masked,
 EOS is included. Token NLL gives equal weight to the positive
@@ -96,13 +97,28 @@ is applied to the per-token losses. Positive features are reused for the prior.
 Backward recomputes each chunk's logits, trading extra
 compute for lower activation memory while preserving the loss and gradients.
 
-Defaults: LoRA rank 8/LR `1e-4`, reward-vector/prior LR `3e-4`, beta `0.1`.
-`--beta inf` samples the unguided frozen policy. All settings are in `train.py`'s
+Defaults: LoRA rank 32/LR `1e-4`, prior LR `3e-4`, initial beta `0.01`.
+Beta is parameterized as `2 ** log_beta`, initialized from `--beta`. After each
+critic optimizer step, `log_beta` increases by `--delta-log-beta` (default `0.1`)
+if the rollout's mean per-token KL exceeds `--kl-target + --kl-range` (defaults
+`1.0 + 0.1`), and decreases by the same amount below `kl_target - kl_range`.
+At or within the boundaries it stays unchanged. The new beta applies to the next
+rollout. Log-space updates are clamped to `log2(min_beta)` through `log2(max_beta)`,
+configured with `--min-beta` (default `0.0001`) and `--max-beta` (default `100`).
+The initial finite beta must be within these bounds. Update indicators are zero
+when already at the corresponding bound.
+KL is the exact vocabulary sum `KL(tilted || base)` in nats, with both
+distributions using the configured temperature, averaged over valid response
+tokens (including EOS, excluding padding).
+Logs include `rollout/kl`, post-update `train/beta` and `train/log_beta`, and
+`train/beta_increment`/`train/beta_decrement` as 0/1 update indicators.
+`--beta inf` samples the unguided frozen policy and disables beta updates.
+All settings are in `train.py`'s
 small dataclass. There is no policy-gradient, TD, or value-anchor loss in GVC.
 
 GVC saves config, JSONL metrics/samples, and `critic.pt` under `outputs/gvc`
 (`outputs/gvc-smoke` for smoke tests). The checkpoint holds trainable parameters,
-optimizer state, config, and step; construct the same critic and load
+optimizer state, adaptive `log_beta`, config, and step; construct the same critic and load
 `checkpoint['trainable']` with `strict=False`. There is no exact RNG/data-loader
 resume. Reusing an output directory overwrites that run's files.
 
@@ -119,7 +135,8 @@ FP32 Bayesian posterior, and sampling with `torch.compile(mode="reduce-overhead"
 Both critic branches remain batched together. SDPA and the existing BF16/FP32
 dtypes are preserved; no explicit FA2 or TF32 precision change is introduced.
 
-Static caches reserve `max_prompt_length + max_response_length` positions. They
+Policy caches reserve `max_prompt_length + max_response_length` positions; critic
+caches also reserve space for the negative instruction. They
 reset between rollouts, so each update uses the current critic weights. Buffers
 are preallocated and position IDs increment in place. Completion is checked
 every 16 tokens (`--stop-check-interval`); any extra padding after EOS is removed

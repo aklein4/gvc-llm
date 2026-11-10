@@ -39,7 +39,7 @@ def main():
     ).cuda().requires_grad_(False).eval()
     critic = GenerativeCritic(AutoModelForCausalLM.from_pretrained(
         model, torch_dtype=torch.bfloat16, attn_implementation='sdpa',
-    ).cuda()).eval()
+    ).cuda(), tokenizer=tokenizer).eval()
     # Only in this benchmark: ignore EOS so every mode does exactly B * length tokens.
     policy.generation_config.eos_token_id = -1
     results = []
