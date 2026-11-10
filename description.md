@@ -14,7 +14,12 @@ including token embeddings, remain frozen.
 
 The positive branch uses the original Abel prompt. The negative branch prepends:
 
-> Deliberately solve the following problem incorrectly and give an incorrect final answer.
+> Solve the problem carefully and give a correct final answer.
+
+The instruction defines a correctness-promoting adjustment. In both training
+and sampling, the negative likelihood is
+`log_softmax(logp_base - (logp_adjustment - logp_base))`, where the base is the
+frozen model with the original prompt and without LoRA, before temperature scaling.
 
 Both branches then score the same response tokens. This instruction is used in
 training and generation, with no learned reward embeddings. Both branches share

@@ -26,7 +26,14 @@ def posterior(logits0, logits1, prior_logits):
     return torch.sigmoid(log_p1 - log_p0 + log_prior[..., 1:2] - log_prior[..., 0:1])
 
 
-NEGATIVE_PROMPT = "Deliberately make a mistake and give an incorrect final answer.\n\n"
+def negative_log_probs(adjustment_logits, base_logits):
+    """Subtract the correctness-promoting log-probability shift from the base."""
+    log_p_base = base_logits.float().log_softmax(-1)
+    correctness_shift = adjustment_logits.float().log_softmax(-1) - log_p_base
+    return (log_p_base - correctness_shift).log_softmax(-1)
+
+
+CORRECTNESS_PROMPT = "Solve the problem carefully and give a correct final answer.\n\n"
 
 
 class GenerativeCritic(nn.Module):
@@ -42,7 +49,7 @@ class GenerativeCritic(nn.Module):
         ))
         embedding = self.lm.get_input_embeddings().weight
         self.register_buffer("negative_prompt_ids", torch.tensor(
-            tokenizer.encode(NEGATIVE_PROMPT, add_special_tokens=False),
+            tokenizer.encode(CORRECTNESS_PROMPT, add_special_tokens=False),
             device=embedding.device, dtype=torch.long,
         ))
         if not self.negative_prompt_ids.numel():
@@ -106,18 +113,29 @@ class GenerativeCritic(nn.Module):
     def logits(self, hidden):
         return self.lm.get_output_embeddings()(hidden)
 
-    def _token_nll(self, hidden, targets, weights):
-        return (F.cross_entropy(self.logits(hidden).float(), targets, reduction="none") * weights).sum()
+    def base_features(self, ids, mask):
+        # No instruction or LoRA: this is the frozen policy used as the reference.
+        with torch.no_grad(), self.lm.disable_adapter():
+            return self.decoder(input_ids=ids, attention_mask=mask,
+                                position_ids=positions(mask), use_cache=False).last_hidden_state
 
-    def token_nll_sum(self, hidden, targets, weights=None):
+    def _token_nll(self, hidden, targets, weights, base_hidden=None):
+        logits = self.logits(hidden).float()
+        if base_hidden is not None:
+            logits = negative_log_probs(logits, self.logits(base_hidden))
+        return (F.cross_entropy(logits, targets, reduction="none") * weights).sum()
+
+    def token_nll_sum(self, hidden, targets, weights=None, base_hidden=None):
         # Checkpoint projection AND cross entropy so vocabulary-sized activations
         # are recomputed one chunk at a time during backward, not retained.
         loss = hidden.sum() * 0.0
         if weights is None:
             weights = torch.ones_like(targets, dtype=torch.float32)
-        for h, y, w in zip(hidden.split(self.lm_head_chunk_size), targets.split(self.lm_head_chunk_size),
-                           weights.split(self.lm_head_chunk_size)):
-            loss = loss + checkpoint(self._token_nll, h, y, w, use_reentrant=False,
+        base_chunks = (base_hidden.split(self.lm_head_chunk_size) if base_hidden is not None
+                       else [None] * len(hidden.split(self.lm_head_chunk_size)))
+        for h, y, w, b in zip(hidden.split(self.lm_head_chunk_size), targets.split(self.lm_head_chunk_size),
+                              weights.split(self.lm_head_chunk_size), base_chunks):
+            loss = loss + checkpoint(self._token_nll, h, y, w, b, use_reentrant=False,
                                      preserve_rng_state=False)
         return loss
 
@@ -142,14 +160,20 @@ class GenerativeCritic(nn.Module):
         )
         hidden = hidden[:, -length - 1:-1]
         positive = hidden[:ids.shape[0]]
-        observed = positive.index_copy(0, negative_rows, hidden[ids.shape[0]:])
         labels = returns[:, None].expand_as(actions)
         if outcome_weights is None:
             outcome_weights = torch.ones(2, device=ids.device)
         prior_loss = F.cross_entropy(self.prior(positive[response_mask].float()),
                                      labels[response_mask], reduction="sum")
-        likelihood = self.token_nll_sum(observed[response_mask], actions[response_mask],
-                                        outcome_weights[labels[response_mask]])
+        positive_mask = response_mask & (returns == 1)[:, None]
+        likelihood = self.token_nll_sum(positive[positive_mask], actions[positive_mask],
+                                        outcome_weights[labels[positive_mask]])
+        if negative_rows.numel():
+            selected = response_mask[negative_rows]
+            base = self.base_features(ids[negative_rows], mask[negative_rows])[:, -length - 1:-1]
+            likelihood = likelihood + self.token_nll_sum(
+                hidden[ids.shape[0]:][selected], actions[negative_rows][selected],
+                outcome_weights[labels[negative_rows][selected]], base[selected])
         return likelihood, prior_loss
 
     def optimizer(self, lora_lr=1e-4, head_lr=3e-4):

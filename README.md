@@ -75,9 +75,12 @@ it has no GRPO grouping. Neither smoke test measures final model quality.
 - `train.py`: generate, verify, train the critic, log, and save.
 - `reward.py`: the shared correctness verifier.
 
-The negative branch prepends “Deliberately solve the following problem incorrectly
-and give an incorrect final answer.” to the existing Abel prompt. The positive
-branch uses the original prompt. Both share the same LoRA and frozen token
+The negative branch prepends “Solve the problem carefully and give a correct final answer.” to the existing Abel prompt. The positive
+branch uses the original prompt. The instruction defines a correctness-promoting adjustment. In both training
+and sampling, the negative likelihood is
+`log_softmax(logp_base - (logp_adjustment - logp_base))`, where the base is the
+frozen model with the original prompt and without LoRA, before temperature scaling.
+Both share the same LoRA and frozen token
 embeddings; there are no trainable reward embeddings. The prior starts at zero. Only the
 observed-return branch receives token-likelihood targets; the positive branch
 supplies prior features for both outcomes. Prompt/padding targets are masked,
@@ -92,7 +95,8 @@ before Bayes' rule. The policy remains frozen throughout.
 Training computes the LM head and cross entropy in checkpointed chunks of
 `--lm-head-chunk-size` valid response tokens (default 128). This is the total
 across sequences and both outcomes within a microbatch, not per sequence.
-Both conditioned branches share one decoder forward pass; outcome balancing
+Both conditioned branches share one decoder forward pass; a separate frozen
+forward supplies the base features for negative targets; outcome balancing
 is applied to the per-token losses. Positive features are reused for the prior.
 Backward recomputes each chunk's logits, trading extra
 compute for lower activation memory while preserving the loss and gradients.

@@ -8,7 +8,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 from verl import DataProto
 from gvc_llm.reward import compute_score
 
-from gvc_llm.model import GenerativeCritic, posterior
+from gvc_llm.model import GenerativeCritic, negative_log_probs, posterior
 from gvc_llm.rollout import GuidedRollout
 
 
@@ -74,7 +74,11 @@ def test_loss_alignment_masking_and_positive_prior():
             r = batch['returns'][row:row+1]
             h, _ = critic.features(ids, mask, r)
             pos, _ = critic.features(ids, mask, torch.ones_like(r))
-            expected_nll += -critic.logits(h[:, -1]).log_softmax(-1)[0, batch['responses'][row, action_pos]]
+            log_probs = critic.logits(h[:, -1]).float().log_softmax(-1)
+            if r.item() == 0:
+                base = critic.logits(critic.base_features(ids, mask)[:, -1]).float().log_softmax(-1)
+                log_probs = (2 * base - log_probs).log_softmax(-1)
+            expected_nll += -log_probs[0, batch['responses'][row, action_pos]]
             expected_prior += -critic.prior(pos[:, -1]).log_softmax(-1)[0, r.item()]
     torch.testing.assert_close(nll, expected_nll)
     torch.testing.assert_close(prior, expected_prior)
@@ -319,7 +323,7 @@ def test_joint_training_forward_matches_separate_branches(returns):
     hook = joint.decoder.register_forward_pre_hook(lambda module, args: calls.append(1))
     actual = joint.loss_sums(batch, weights)
     hook.remove()
-    assert len(calls) == 1
+    assert len(calls) == 1 + int(0 in returns)
     expected_nll = expected_prior = 0
     for row, outcome in enumerate(returns):
         ids = batch['input_ids'][row:row+1]
@@ -328,8 +332,12 @@ def test_joint_training_forward_matches_separate_branches(returns):
         r = batch['returns'][row:row+1]
         observed, _ = separate.features(ids, mask, r)
         positive, _ = separate.features(ids, mask, torch.ones_like(r))
+        logits = separate.logits(observed[:, -3:-1][selected]).float()
+        if outcome == 0:
+            base_logits = separate.logits(separate.base_features(ids, mask)[:, -3:-1][selected]).float()
+            logits = (2 * base_logits.log_softmax(-1) - logits.log_softmax(-1)).log_softmax(-1)
         expected_nll += weights[outcome] * torch.nn.functional.cross_entropy(
-            separate.logits(observed[:, -3:-1][selected]).float(),
+            logits,
             batch['responses'][row:row+1][selected], reduction='sum')
         expected_prior += torch.nn.functional.cross_entropy(
             separate.prior(positive[:, -3:-1][selected].float()),
@@ -345,13 +353,13 @@ def test_joint_training_forward_matches_separate_branches(returns):
 
 @torch.no_grad()
 def test_instruction_prefix_matches_explicit_prompt_and_preserves_positive():
-    from gvc_llm.model import NEGATIVE_PROMPT, positions
+    from gvc_llm.model import CORRECTNESS_PROMPT, positions
 
     encoded = []
     tokenizer = tiny_tokenizer()
     tokenizer.encode = lambda text, add_special_tokens: encoded.append((text, add_special_tokens)) or [11, 12, 13]
     critic = GenerativeCritic(tiny_lm(), rank=2, tokenizer=tokenizer).eval()
-    assert encoded == [(NEGATIVE_PROMPT, False)]
+    assert encoded == [(CORRECTNESS_PROMPT, False)]
     ids = torch.tensor([[0, 3, 4], [5, 6, 7]])
     mask = (ids != 0).long()
     for outcome in (0, 1):
@@ -363,3 +371,33 @@ def test_instruction_prefix_matches_explicit_prompt_and_preserves_positive():
         expected = critic.decoder(input_ids=expected_ids, attention_mask=expected_mask,
                                   position_ids=positions(expected_mask)).last_hidden_state[:, -3:]
         torch.testing.assert_close(actual[mask.bool()], expected[mask.bool()], atol=1e-6, rtol=1e-5)
+
+
+def test_negative_likelihood_subtracts_correctness_shift():
+    base = torch.tensor([[.2, .3, .5]])
+    adjustment = torch.tensor([[.4, .3, .3]], requires_grad=True)
+    actual = negative_log_probs(adjustment.log() + 17, base.log() - 9)
+    expected = base.square() / adjustment
+    expected = expected / expected.sum(-1, keepdim=True)
+    torch.testing.assert_close(actual.exp(), expected)
+    (-actual[0, 0]).backward()
+    assert adjustment.grad[0, 0] > 0  # Fitting failure suppresses its adjustment likelihood.
+    torch.testing.assert_close(negative_log_probs(base.log(), base.log()), base.log())
+
+
+@torch.no_grad()
+def test_training_base_reference_excludes_lora_and_instruction():
+    base = tiny_lm().eval().requires_grad_(False)
+    critic = GenerativeCritic(copy.deepcopy(base), rank=2, tokenizer=tiny_tokenizer()).eval()
+    for name, parameter in critic.lm.named_parameters():
+        if 'lora_B' in name:
+            parameter.normal_(std=.2)
+    batch = tiny_batch()
+    ids, mask = batch['input_ids'], batch['attention_mask']
+    from gvc_llm.model import positions
+    expected = base.model(input_ids=ids, attention_mask=mask,
+                          position_ids=positions(mask)).last_hidden_state
+    actual = critic.base_features(ids, mask)
+    torch.testing.assert_close(actual, expected)
+    adapted, _ = critic.features(ids, mask, torch.ones(2, dtype=torch.long))
+    assert not torch.allclose(adapted[mask.bool()], actual[mask.bool()])

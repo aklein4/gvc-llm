@@ -6,7 +6,7 @@ import torch
 from verl import DataProto
 from transformers import StaticCache
 
-from .model import posterior, positions
+from .model import negative_log_probs, posterior, positions
 
 
 class GuidedRollout:
@@ -71,7 +71,8 @@ class GuidedRollout:
                     cache=critic_cache, use_cache=True,
                 )
                 negative, positive = hidden[:, -1].chunk(2)
-                q = posterior(self.critic.logits(negative), self.critic.logits(positive),
+                q = posterior(negative_log_probs(self.critic.logits(negative), logits),
+                              self.critic.logits(positive),
                               self.critic.prior(positive.float()))
                 logits = logits + q / self.beta
             log_probs = (logits / self.temperature).log_softmax(-1)
@@ -116,7 +117,8 @@ class GuidedRollout:
                 cache=self.critic_cache, use_cache=True, prefill=prefill,
             )
             negative, positive = hidden[:, -1].chunk(2)
-            q = posterior(self.critic.logits(negative), self.critic.logits(positive),
+            q = posterior(negative_log_probs(self.critic.logits(negative), logits),
+                          self.critic.logits(positive),
                           self.critic.prior(positive.float()))
             logits = logits + q / self._beta
         log_probs = (logits / self.temperature).log_softmax(-1)
