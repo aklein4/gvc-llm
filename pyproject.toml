@@ -1,0 +1,59 @@
+[project]
+name = "gvc-llm"
+version = "0.1.0"
+description = "Token-level generative value classification with verl"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "verl==0.6.1",
+  "torch==2.8.0",
+  "triton==3.4.0",
+  "transformers==4.57.6",
+  "peft==0.17.1",
+  "datasets==4.0.0",
+  "wandb==0.23.1",
+  "python-dotenv>=1,<2",
+  "numpy>=1.26,<2",
+  "vllm==0.11.0",
+  "flash-attn==2.8.3",
+  "torchvision==0.23.0",
+  "torchaudio==2.8.0",
+  "math-verify==0.8.0",
+  "antlr4-python3-runtime==4.9.3",
+  "pytest>=8,<9",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux'"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu129", marker = "platform_machine == 'aarch64'" },
+  { index = "pytorch-cu128", marker = "platform_machine != 'aarch64'" },
+]
+torchvision = [
+  { index = "pytorch-cu129", marker = "platform_machine == 'aarch64'" },
+  { index = "pytorch-cu128", marker = "platform_machine != 'aarch64'" },
+]
+torchaudio = [
+  { index = "pytorch-cu129", marker = "platform_machine == 'aarch64'" },
+  { index = "pytorch-cu128", marker = "platform_machine != 'aarch64'" },
+]
+triton = { index = "pytorch-cu129", marker = "platform_machine == 'aarch64'" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch==2.8.0", "triton==3.4.0", "setuptools", "packaging", "ninja"]
